@@ -1,0 +1,232 @@
+library(nflreadr)
+library(nflfastR)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(xgboost)
+library(vip)
+library(ggplot2)
+library(ggthemes)
+library(caret)
+
+partpbp <- load_participation(seasons = 2016:2023, include_pbp = TRUE)
+
+
+
+
+qbpbp <- partpbp %>%
+  filter(qb_dropback == 1)
+
+qbclean <- qbpbp %>%
+  select(season, week, passer_player_name, down, ydstogo, offense_formation, number_of_pass_rushers, offense_personnel, was_pressure, 
+         xpass, game_seconds_remaining, yardline_100, sack, score_differential)
+
+
+qbsfiltered <- qbclean %>%
+  filter(!is.na(down))
+
+qbsfiltered <- qbsfiltered %>%
+  mutate(was_pressure = ifelse(sack == 1, TRUE, was_pressure))
+
+
+qbsfiltered <- na.omit(qbsfiltered)
+
+encodedqb <- qbsfiltered %>%
+  mutate(formation = as.factor(offense_formation)) %>%
+  pivot_wider(names_from = formation, values_from = formation, values_fn = length, values_fill = 0)
+
+extract_personnel <- function(personnel) {
+  rb <- str_extract(personnel, "(?<=,\\s|^)\\d+(?=\\sRB|,)")
+  te <- str_extract(personnel, "(?<=,\\s|^)\\d+(?=\\sTE|,)")
+  combined <- paste0(rb, te)
+  return(combined)
+}
+
+
+fixedpers <- encodedqb %>%
+  mutate(personnel = extract_personnel(offense_personnel))
+
+encodedqbready <- fixedpers %>%
+  mutate(personnel = as.factor(personnel)) %>%
+  pivot_wider(names_from = personnel, values_from = personnel, values_fn = length, values_fill = 0)
+
+encodedqbready <- encodedqbready %>%
+  mutate(down = as.factor(down)) %>%
+  pivot_wider(names_from = down, values_from = down, values_fn = length, values_fill = 0)
+
+
+qbdata <- encodedqbready %>%
+    select(passer_player_name, season, week,`1`, `2`, `3`,`4`, ydstogo, number_of_pass_rushers, was_pressure, xpass, game_seconds_remaining, sack, score_differential,
+           SHOTGUN, I_FORM, SINGLEBACK, PISTOL, EMPTY, JUMBO, `21`, `11`, `10`, `12`, `13`, `20`, `10`, `01`, `02`)
+
+qbfinaldata <- qbdata %>%
+  mutate(pressure = ifelse(was_pressure == TRUE, 1, 0)) %>%
+  select(-was_pressure)
+  
+
+
+set.seed(2015)
+
+
+train_data <- qbfinaldata[!qbfinaldata$season %in% c(2021, 2022), ]
+
+test_data <- qbfinaldata[qbfinaldata$season %in% c(2021, 2022), ]
+
+
+train_data1 <- na.omit(train_data)
+test_data1 <- na.omit(test_data)
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_data1[, !names(train_data1) %in% c("sack", "passer_player_name", "season", "week")]), label = train_data1$sack)
+dtest <- xgb.DMatrix(data = as.matrix(test_data1[, !names(test_data1) %in% c("sack", "passer_player_name", "season", "week")]), label = test_data1$sack)
+
+
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eta = 0.3,
+  max_depth = 2,
+  min_child_weight = 1,
+  lambda = 1
+)
+
+model <- xgboost(params = params, data = dtrain, nrounds = 100)
+
+pred <- predict(model, dtest)
+
+pred <- as.numeric(pred)
+
+joined <- cbind(test_data1, pred)
+
+
+
+pbpsacks <- joined %>%
+  group_by(passer_player_name, season) %>%
+  summarise(sue = sum(pred - sack),
+            dropbacks = n())
+
+pbpsacks <- pbpsacks %>%
+  filter(dropbacks >= 250)
+
+pbppredict <- qbfinaldata %>%
+  filter(season == 2023)
+
+qbpbp <- pbppredict %>%
+  filter(qb_dropback == 1)
+
+qbepa <- qbpbp %>%
+  filter(!is.na(down))
+
+qbepa <- qbepa %>%
+  group_by(passer_player_name, posteam) %>%
+  summarise(epa = mean(epa),
+            dropbacks = n())
+
+qbepas <- qbepa %>%
+  filter(dropbacks >= 250)
+
+qbepas <- qbepas %>%
+  filter(!is.na(passer_player_name))
+
+joinedgraph <- merge(pbpsacks2023, qbepas, by = "passer_player_name")
+
+joinedgraph <- joinedgraph %>%
+  left_join(teams_colors_logos, by = c("posteam" = "team_abbr"))
+
+
+joinedgraph %>%
+  ggplot(aes(x = sue, y = epa)) +
+  geom_point(aes(fill = team_color, color = team_color2, size = dropbacks.x), shape = 21,alpha = 0.9) + 
+  scale_color_identity(aesthetics = c("fill", "color")) +
+  theme_fivethirtyeight() +
+  labs(
+    title = "Sacks Avoidance vs Dropback EPA/Play in 2023",
+    subtitle = "Minimum 250 Dropbacks") +
+  theme(axis.title = element_text(size = 13)) + xlab("2023 Sacks Taken Under Expected ") + ylab("Dropback EPA/Play") +
+  theme(panel.grid.minor = element_blank()) + 
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 8)) + 
+  ggrepel::geom_text_repel(aes(label = passer_player_name), size = 5) +
+  theme(plot.title = element_text(size = 21, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 20, hjust = 0.5)) +
+  geom_hline(yintercept = mean(joinedgraph$epa), linetype = "dashed") 
+
+
+
+qbclean <- qbpbp %>%
+  select(season, week, passer_player_name, down, ydstogo, offense_formation, number_of_pass_rushers, offense_personnel, was_pressure, 
+         xpass, game_seconds_remaining, yardline_100, sack, score_differential)
+
+
+qbsfiltered <- qbclean %>%
+  filter(!is.na(down))
+
+qbsfiltered <- qbsfiltered %>%
+  mutate(was_pressure = ifelse(sack == 1, TRUE, was_pressure))
+
+
+qbsfiltered <- na.omit(qbsfiltered)
+
+encodedqb <- qbsfiltered %>%
+  mutate(formation = as.factor(offense_formation)) %>%
+  pivot_wider(names_from = formation, values_from = formation, values_fn = length, values_fill = 0)
+
+extract_personnel <- function(personnel) {
+  # Extract the number before RB
+  rb <- str_extract(personnel, "(?<=,\\s|^)\\d+(?=\\sRB|,)")
+  # Extract the number before TE
+  te <- str_extract(personnel, "(?<=,\\s|^)\\d+(?=\\sTE|,)")
+  # Combine RB and TE numbers
+  combined <- paste0(rb, te)
+  return(combined)
+}
+
+
+fixedpers <- encodedqb %>%
+  mutate(personnel = extract_personnel(offense_personnel))
+
+encodedqbready <- fixedpers %>%
+  mutate(personnel = as.factor(personnel)) %>%
+  pivot_wider(names_from = personnel, values_from = personnel, values_fn = length, values_fill = 0)
+
+encodedqbready <- encodedqbready %>%
+  mutate(down = as.factor(down)) %>%
+  pivot_wider(names_from = down, values_from = down, values_fn = length, values_fill = 0)
+
+
+qbdata <- encodedqbready %>%
+  select(passer_player_name, season, week,`1`, `2`, `3`,`4`, ydstogo, number_of_pass_rushers, was_pressure, xpass, game_seconds_remaining, sack, score_differential,
+         SHOTGUN, I_FORM, SINGLEBACK, PISTOL, EMPTY, JUMBO, `21`, `11`, `10`, `12`, `13`, `20`, `10`, `01`, `02`)
+
+qbfinaldata2023 <- qbdata %>%
+  mutate(pressure = ifelse(was_pressure == TRUE, 1, 0)) %>%
+  select(-was_pressure)
+
+
+pbppredict <- na.omit(pbppredict)
+
+d2023 <- xgb.DMatrix(data = as.matrix(pbppredict[, !names(pbppredict) %in% c("sack", "passer_player_name", "season", "week")]), label = pbppredict$sack)
+
+predictions_2023 <- predict(model, d2023)
+
+joined2023 <- cbind(pbppredict, predictions_2023)
+
+pbpsacks2023 <- joined2023 %>%
+  group_by(passer_player_name, season) %>%
+  summarise(sue = sum(predictions_2023 - sack),
+            dropbacks = n())
+
+pbpsacks2023 <- pbpsacks2023 %>%
+  filter(dropbacks >= 250)
+
+rmse <- sqrt(mean((pred - test_data1$sack)^2))
+print(paste("RMSE: ", rmse))
+
+
+
+vip(model)
+postResample(predictions, test_data1$sack_total)
+
+
+
+
+
